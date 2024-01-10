@@ -39,4 +39,4 @@ The script performs the following steps:
 
 # Security Note
 
-This script includes a demonstration of key handling mechanisms. Ensure to follow best practices for key management and security when adapting the script for production use.
+This script includes a demonstration of key handling mechanisms. Ensure to follow best practices for key management and security when adapting the script for production use based on the links provided within the blog. 
