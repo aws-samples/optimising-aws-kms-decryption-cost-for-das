@@ -16,7 +16,6 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-
 import json
 import zlib
 import aws_encryption_sdk
@@ -27,51 +26,58 @@ from aws_encryption_sdk.internal.crypto import WrappingKey
 from aws_encryption_sdk.key_providers.raw import RawMasterKeyProvider
 from aws_encryption_sdk.identifiers import WrappingAlgorithm, EncryptionKeyType
 
+# Constants for AWS resources and region. Please use environment variables instead
 
 REGION_NAME = ""  # Region
 RESOURCE_ID = ""  # Aurora Cluster ID
 STREAM_NAME = ""  # Kinesis Data Stream name
 
+# Initialize the AWS Encryption SDK client with a specific commitment policy
 enc_client = aws_encryption_sdk.EncryptionSDKClient(commitment_policy=CommitmentPolicy.FORBID_ENCRYPT_ALLOW_DECRYPT)
 
-
+# Custom key provider class for raw encryption/decryption operations
 class MyRawMasterKeyProvider(RawMasterKeyProvider):
-    provider_id = "BC"
+    provider_id = "BC"  # Custom provider ID
 
     def __new__(cls, *args, **kwargs):
+        # Overriding the object creation process for proper initialization
         obj = super(RawMasterKeyProvider, cls).__new__(cls)
         return obj
 
     def __init__(self, plain_key):
-        RawMasterKeyProvider.__init__(self)
-        self.wrapping_key = WrappingKey(wrapping_algorithm=WrappingAlgorithm.AES_256_GCM_IV12_TAG16_NO_PADDING,
-                                        wrapping_key=plain_key, wrapping_key_type=EncryptionKeyType.SYMMETRIC)
+        # Initializing the parent class and setting up a wrapping key
+        super().__init__()
+        self.wrapping_key = WrappingKey(
+            wrapping_algorithm=WrappingAlgorithm.AES_256_GCM_IV12_TAG16_NO_PADDING,
+            wrapping_key=plain_key,
+            wrapping_key_type=EncryptionKeyType.SYMMETRIC)
 
     def _get_raw_key(self, key_id):
+        # Method to retrieve the raw key; here, it returns the initialized wrapping key
         return self.wrapping_key
 
-
-### THIS IS SIMPLY A DEMO ON HOW TO RETAIN DECRYPTED DATA KEYS
-### ALWAYS STORE KEYS IN SECURE STRUCTURES
+# Class for caching decrypted data keys using AWS KMS
 class KMSDataKeyCache():
     def __init__(self, session):
+        # Initialize the KMS client and a simple dictionary for caching keys
         self.kms_client = session.client('kms', region_name=REGION_NAME)
-        # For this demo we will just use a dict, but an expiring cache is ideal
         self.key_cache = {}
 
     def getDecrypted(self, data_key_decoded):
+        # Attempt to retrieve the decrypted key from cache or decrypt it using KMS
         if data_key_decoded in self.key_cache:
-            # If we've already decrypted this key, then no need to call KMS
             return self.key_cache[data_key_decoded]
         else:
-            # If we don't have a decrypted copy of this key, then get one from KMS
-            data_key_decrypt_result = self.kms_client.decrypt(CiphertextBlob=data_key_decoded,
-                                                              EncryptionContext={'aws:rds:dbc-id': RESOURCE_ID})
+            # Decrypt the key using KMS and store it in the cache
+            data_key_decrypt_result = self.kms_client.decrypt(
+                CiphertextBlob=data_key_decoded,
+                EncryptionContext={'aws:rds:dbc-id': RESOURCE_ID})
             self.key_cache[data_key_decoded] = data_key_decrypt_result['Plaintext']
-            return self.key_cache[data_key_decoded]
+            return data_key_decrypt_result['Plaintext']
 
-
+# Function to decrypt payload with a provided data key
 def decrypt_payload(payload, data_key):
+    # Setup the key provider and decrypt the payload
     my_key_provider = MyRawMasterKeyProvider(data_key)
     my_key_provider.add_master_key("DataKey")
     decrypted_plaintext, header = enc_client.decrypt(
@@ -80,48 +86,43 @@ def decrypt_payload(payload, data_key):
             master_key_provider=my_key_provider))
     return decrypted_plaintext
 
-
+# Function to decrypt and then decompress the payload
 def decrypt_decompress(payload, key):
     decrypted = decrypt_payload(payload, key)
     return zlib.decompress(decrypted, zlib.MAX_WBITS + 16)
 
-
+# The main Lambda handler function
 def lambda_handler(event, context):
+    # Initialize a session and the KMS data key cache
     session = boto3.session.Session()
-    # Initialize a cache to get KMS data keys from
     kms_data_key_cache = KMSDataKeyCache(session)
-    # Initialize Kinesis client
-    kinesis = session.client('kinesis', region_name=REGION_NAME)
-    # Iterate over all shards in the DAS stream and get records
-    response = kinesis.describe_stream(StreamName=STREAM_NAME)
-    shard_iters = []
-    for shard in response['StreamDescription']['Shards']:
-        shard_iter_response = kinesis.get_shard_iterator(StreamName=STREAM_NAME, ShardId=shard['ShardId'],
-                                                         ShardIteratorType='LATEST')
-        shard_iters.append(shard_iter_response['ShardIterator'])
 
-    while len(shard_iters) > 0:
-        next_shard_iters = []
-        for shard_iter in shard_iters:
-            response = kinesis.get_records(ShardIterator=shard_iter, Limit=10000)
-            for record in response['Records']:
-                record_data = record['Data']
-                # Deserialize DAS payload to python object
-                record_data = json.loads(record_data)
-                # Base64 decode the payload
-                payload_decoded = base64.b64decode(record_data['databaseActivityEvents'])
-                data_key_decoded = base64.b64decode(record_data['key'])
-                # Request a decrypted copy of the key from the cache
-                # (which will only call KMS the first time we see a particular data key)
-                data_key_decrypted = kms_data_key_cache.getDecrypted(data_key_decoded)
-                decrypted = decrypt_payload(payload_decoded, data_key_decrypted)
-                decrypted_das_records = zlib.decompress(decrypted, zlib.MAX_WBITS + 16)
-                print(decrypted_das_records)
-            if 'NextShardIterator' in response:
-                next_shard_iters.append(response['NextShardIterator'])
-        shard_iters = next_shard_iters
+    # Process each record in the event
+    for record in event['Records']:
+        try:
+            # Decode and parse the incoming data
+            data = base64.b64decode(record['kinesis']['data'])
+            record_data = json.loads(data)
+            payload_decoded = base64.b64decode(record_data['databaseActivityEvents'])
+            data_key_decoded = base64.b64decode(record_data['key'])
 
+            # Get the decrypted data key from the cache or KMS
+            decrypted_data_key = kms_data_key_cache.getDecrypted(data_key_decoded)
+
+            # Decrypt and decompress the payload
+            decrypted_decompressed_payload = decrypt_decompress(payload_decoded, decrypted_data_key)
+            plaintext = decrypted_decompressed_payload.decode('utf-8')
+
+            # Load the JSON events and log them
+            events = json.loads(plaintext)
+            print("Processed events:", events)
+
+        except Exception as e:
+            # Log any errors encountered during processing
+            print(f"Error processing record: {str(e)}")
+
+    # Return a success status code and message
     return {
         'statusCode': 200,
-        'body': 'Processing Complete'
-    }
+        'body': json.dumps('Processing Complete')
+}
